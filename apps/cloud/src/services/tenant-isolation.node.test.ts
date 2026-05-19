@@ -263,13 +263,12 @@ describe("tenant isolation (HTTP)", () => {
               },
             },
           });
-          yield* client.openapi.setSourceBinding({
+          yield* client.sources.setBinding({
             params: { scopeId: ScopeId.make(orgA) },
             payload: {
-              sourceId: namespaceA,
-              sourceScope: ScopeId.make(orgA),
               scope: ScopeId.make(orgA),
-              slot: "header:authorization",
+              source: { id: namespaceA, scope: ScopeId.make(orgA) },
+              slotKey: "header:authorization",
               value: { kind: "secret", secretId: secretIdA },
             },
           });
@@ -299,13 +298,12 @@ describe("tenant isolation (HTTP)", () => {
             params: { scopeId: ScopeId.make(orgA) },
             payload: makeTenantOpenApiSourcePayload(namespaceA),
           });
-          yield* client.openapi.setSourceBinding({
+          yield* client.sources.setBinding({
             params: { scopeId: ScopeId.make(orgA) },
             payload: {
-              sourceId: namespaceA,
-              sourceScope: ScopeId.make(orgA),
               scope: ScopeId.make(orgA),
-              slot: "auth:conn",
+              source: { id: namespaceA, scope: ScopeId.make(orgA) },
+              slotKey: "auth:conn",
               value: { kind: "connection", connectionId: connectionIdA },
             },
           });
@@ -348,12 +346,17 @@ describe("tenant isolation (HTTP)", () => {
       );
 
       yield* asOrg(orgA, (client) =>
-        client.openapi.updateSource({
-          params: { scopeId: ScopeId.make(orgA), namespace },
+        client.sources.configure({
+          params: { scopeId: ScopeId.make(orgA) },
           payload: {
-            sourceScope: ScopeId.make(orgA),
-            name: "Org A Updated API",
-            baseUrl: "https://org-a-updated.example.com",
+            source: { id: namespace, scope: ScopeId.make(orgA) },
+            scope: ScopeId.make(orgA),
+            type: "openapi",
+            config: {
+              scope: orgA,
+              name: "Org A Updated API",
+              baseUrl: "https://org-a-updated.example.com",
+            },
           },
         }),
       );

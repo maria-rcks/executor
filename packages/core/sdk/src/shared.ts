@@ -39,10 +39,32 @@ export {
 export {
   ConfiguredCredentialBinding,
   ConfiguredCredentialValue,
+  CredentialBindingRef,
   CredentialBindingValue,
+  CredentialBindingSlotInput,
+  RemoveCredentialBindingInput,
+  RemoveSourceCredentialBindingInput,
   ScopedSecretCredentialInput,
+  SetSourceCredentialBindingInput,
+  ReplaceCredentialBindingValue,
+  ReplaceCredentialBindingsInput,
+  ReplaceSourceCredentialBindingsInput,
+  SourceCredentialBindingSource,
+  SourceCredentialBindingSourceInput,
+  SourceCredentialBindingSlotInput,
   credentialSlotKey,
+  credentialSlotPart,
 } from "./credential-bindings";
+
+export {
+  pluginStorageId,
+  type PluginStorageEntry,
+  type PluginStorageFacade,
+  type PluginStorageKeyInput,
+  type PluginStorageListInput,
+  type PluginStoragePutInput,
+  type PluginStorageScopedKeyInput,
+} from "./plugin-storage";
 
 export { SourceDetectionResult, type Source } from "./types";
 

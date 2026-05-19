@@ -230,7 +230,6 @@ describe("sources api (HTTP)", () => {
           .addSource({
             params: { scopeId },
             payload: {
-              targetScope: scopeId,
               transport: "remote",
               name: "Broken MCP",
               endpoint: "http://127.0.0.1:1/mcp",
@@ -275,7 +274,6 @@ describe("sources api (HTTP)", () => {
         client.graphql.addSource({
           params: { scopeId },
           payload: {
-            targetScope: scopeId,
             endpoint: server.endpoint,
             namespace,
             name: "Cloud GraphQL",
@@ -327,6 +325,66 @@ describe("sources api (HTTP)", () => {
     }),
   );
 
+  it.effect(
+    "GraphQL add accepts a user-scoped bearer credential for org source introspection",
+    () =>
+      Effect.gen(function* () {
+        const server = yield* serveGraphqlTestServer({
+          schema: makeGreetingGraphqlSchema({ includeMutation: false }),
+          auth: {
+            validateAuthorization: (authorization) =>
+              Effect.succeed(authorization === "Bearer github-token"),
+          },
+        });
+        const orgId = `org_${crypto.randomUUID()}`;
+        const userId = `user_${crypto.randomUUID()}`;
+        const userScope = testUserOrgScopeId(userId, orgId);
+        const namespace = `github_graphql_${crypto.randomUUID().replace(/-/g, "_")}`;
+
+        yield* asUser(userId, orgId, (client) =>
+          client.secrets.set({
+            params: { scopeId: ScopeId.make(userScope) },
+            payload: {
+              id: SecretId.make("github-graphql-authorization"),
+              name: "Github GraphQL Authorization",
+              value: "github-token",
+            },
+          }),
+        );
+
+        const added = yield* asUser(userId, orgId, (client) =>
+          client.graphql.addSource({
+            params: { scopeId: ScopeId.make(orgId) },
+            payload: {
+              endpoint: server.endpoint,
+              namespace,
+              name: "Github GraphQL",
+              headers: {
+                Authorization: { kind: "secret", prefix: "Bearer " },
+              },
+              credentials: {
+                scope: ScopeId.make(userScope),
+                headers: {
+                  Authorization: {
+                    kind: "secret",
+                    secretId: "github-graphql-authorization",
+                    secretScope: userScope,
+                    prefix: "Bearer ",
+                  },
+                },
+              },
+            },
+          }),
+        );
+
+        expect(added).toEqual({ namespace, toolCount: 1 });
+        const requests = yield* server.requests;
+        expect(
+          requests.some((request) => request.headers.authorization === "Bearer github-token"),
+        ).toBe(true);
+      }),
+  );
+
   it.effect("added MCP source can be inspected and invoked through execution", () =>
     Effect.gen(function* () {
       const server = yield* serveMcpServer(() =>
@@ -344,7 +402,6 @@ describe("sources api (HTTP)", () => {
         client.mcp.addSource({
           params: { scopeId },
           payload: {
-            targetScope: scopeId,
             transport: "remote",
             name: "Cloud MCP",
             endpoint: server.endpoint,
@@ -453,7 +510,7 @@ describe("sources api (HTTP)", () => {
     }),
   );
 
-  it.effect("openapi.updateSource round-trips baseUrl + name changes", () =>
+  it.effect("sources.configure round-trips OpenAPI baseUrl + name changes", () =>
     Effect.gen(function* () {
       const org = `org_${crypto.randomUUID()}`;
       const namespace = `ns_${crypto.randomUUID().replace(/-/g, "_")}`;
@@ -464,12 +521,17 @@ describe("sources api (HTTP)", () => {
             params: { scopeId: ScopeId.make(org) },
             payload: makeMinimalOpenApiSourcePayload(namespace),
           });
-          yield* client.openapi.updateSource({
-            params: { scopeId: ScopeId.make(org), namespace },
+          yield* client.sources.configure({
+            params: { scopeId: ScopeId.make(org) },
             payload: {
-              sourceScope: ScopeId.make(org),
-              name: "Renamed API",
-              baseUrl: "https://override.example.com",
+              source: { id: namespace, scope: ScopeId.make(org) },
+              scope: ScopeId.make(org),
+              type: "openapi",
+              config: {
+                scope: org,
+                name: "Renamed API",
+                baseUrl: "https://override.example.com",
+              },
             },
           });
         }),
@@ -517,13 +579,12 @@ describe("sources api (HTTP)", () => {
               value: "alice-secret",
             },
           });
-          const binding = yield* client.openapi.setSourceBinding({
+          const binding = yield* client.sources.setBinding({
             params: { scopeId: ScopeId.make(aliceScope) },
             payload: {
-              sourceId: namespace,
-              sourceScope: ScopeId.make(orgId),
               scope: ScopeId.make(aliceScope),
-              slot: "header:authorization",
+              source: { id: namespace, scope: ScopeId.make(orgId) },
+              slotKey: "header:authorization",
               value: {
                 kind: "secret",
                 secretId: SecretId.make("alice_pat"),
@@ -534,7 +595,7 @@ describe("sources api (HTTP)", () => {
             sourceId: namespace,
             sourceScopeId: ScopeId.make(orgId),
             scopeId: ScopeId.make(aliceScope),
-            slot: "header:authorization",
+            slotKey: "header:authorization",
             value: {
               kind: "secret",
               secretId: SecretId.make("alice_pat"),
@@ -555,13 +616,12 @@ describe("sources api (HTTP)", () => {
               value: "bob-secret",
             },
           });
-          yield* client.openapi.setSourceBinding({
+          yield* client.sources.setBinding({
             params: { scopeId: ScopeId.make(bobScope) },
             payload: {
-              sourceId: namespace,
-              sourceScope: ScopeId.make(orgId),
               scope: ScopeId.make(bobScope),
-              slot: "header:authorization",
+              source: { id: namespace, scope: ScopeId.make(orgId) },
+              slotKey: "header:authorization",
               value: {
                 kind: "secret",
                 secretId: SecretId.make("bob_pat"),
@@ -572,10 +632,10 @@ describe("sources api (HTTP)", () => {
       );
 
       const aliceBindings = yield* asUser(aliceId, orgId, (client) =>
-        client.openapi.listSourceBindings({
+        client.sources.listBindings({
           params: {
             scopeId: ScopeId.make(aliceScope),
-            namespace,
+            sourceId: namespace,
             sourceScopeId: ScopeId.make(orgId),
           },
         }),
@@ -583,7 +643,7 @@ describe("sources api (HTTP)", () => {
       expect(aliceBindings).toContainEqual(
         expect.objectContaining({
           scopeId: ScopeId.make(aliceScope),
-          slot: "header:authorization",
+          slotKey: "header:authorization",
           value: {
             kind: "secret",
             secretId: SecretId.make("alice_pat"),
@@ -594,17 +654,17 @@ describe("sources api (HTTP)", () => {
       expect(
         aliceBindings.some(
           (binding) =>
-            binding.slot === "header:authorization" &&
+            binding.slotKey === "header:authorization" &&
             binding.value.kind === "secret" &&
             binding.value.secretId === SecretId.make("bob_pat"),
         ),
       ).toBe(false);
 
       const bobBindings = yield* asUser(bobId, orgId, (client) =>
-        client.openapi.listSourceBindings({
+        client.sources.listBindings({
           params: {
             scopeId: ScopeId.make(bobScope),
-            namespace,
+            sourceId: namespace,
             sourceScopeId: ScopeId.make(orgId),
           },
         }),
@@ -612,7 +672,7 @@ describe("sources api (HTTP)", () => {
       expect(bobBindings).toContainEqual(
         expect.objectContaining({
           scopeId: ScopeId.make(bobScope),
-          slot: "header:authorization",
+          slotKey: "header:authorization",
           value: {
             kind: "secret",
             secretId: SecretId.make("bob_pat"),
@@ -623,7 +683,7 @@ describe("sources api (HTTP)", () => {
       expect(
         bobBindings.some(
           (binding) =>
-            binding.slot === "header:authorization" &&
+            binding.slotKey === "header:authorization" &&
             binding.value.kind === "secret" &&
             binding.value.secretId === SecretId.make("alice_pat"),
         ),

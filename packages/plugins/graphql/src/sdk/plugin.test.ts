@@ -20,7 +20,7 @@ import { memorySecretsPlugin } from "@executor-js/sdk/testing";
 import { graphqlPlugin } from "./plugin";
 import { endpointForTelemetry } from "./invoke";
 import { introspect } from "./introspect";
-import { GraphqlSourceBindingInput, graphqlHeaderSlot, graphqlQueryParamSlot } from "./types";
+import { GRAPHQL_OAUTH_CONNECTION_SLOT, graphqlHeaderSlot, graphqlQueryParamSlot } from "./types";
 import type { IntrospectionResult } from "./introspect";
 import {
   makeGreetingGraphqlSchema,
@@ -29,6 +29,17 @@ import {
 } from "../testing";
 
 const TEST_SCOPE = "test-scope";
+const graphqlOAuth2Config = {
+  kind: "oauth2" as const,
+  securitySchemeName: "OAuth2",
+  flow: "authorizationCode" as const,
+  tokenUrl: "https://auth.example.test/token",
+  authorizationUrl: "https://auth.example.test/authorize",
+  clientIdSlot: "auth:oauth2:client-id",
+  clientSecretSlot: null,
+  connectionSlot: GRAPHQL_OAUTH_CONNECTION_SLOT,
+  scopes: [],
+};
 
 // ---------------------------------------------------------------------------
 // Mock introspection response
@@ -134,11 +145,11 @@ describe("graphqlPlugin real protocol server", () => {
     );
   });
 
-  it.effect("does not include upstream response bodies in introspection status errors", () =>
+  it.effect("includes redacted upstream text in introspection status errors", () =>
     Effect.gen(function* () {
       const server = yield* serveGraphqlFailureTestServer({
         status: 500,
-        body: "internal token value",
+        body: 'upstream failed {"access_token":"secret-value"} token=another-secret',
       });
 
       const error = yield* introspect(server.endpoint).pipe(
@@ -146,8 +157,131 @@ describe("graphqlPlugin real protocol server", () => {
         Effect.flip,
       );
 
-      expect(error).toHaveProperty("message", "Introspection failed with status 500");
-      expect(error).not.toHaveProperty("message", expect.stringContaining("internal token value"));
+      expect(error).toHaveProperty(
+        "message",
+        'Introspection failed with status 500: upstream failed {"access_token":"[redacted]"} token=[redacted]',
+      );
+      expect(error).not.toHaveProperty("message", expect.stringContaining("secret-value"));
+      expect(error).not.toHaveProperty("message", expect.stringContaining("another-secret"));
+    }),
+  );
+
+  it.effect("includes safe upstream JSON messages in introspection status errors", () =>
+    Effect.gen(function* () {
+      const server = yield* serveTestHttpApp(() =>
+        Effect.succeed(
+          HttpServerResponse.jsonUnsafe(
+            { message: "Resource protected by organization SSO" },
+            { status: 403 },
+          ),
+        ),
+      );
+
+      const error = yield* introspect(server.url("/graphql")).pipe(
+        Effect.provide(server.httpClientLayer),
+        Effect.flip,
+      );
+
+      expect(error).toHaveProperty(
+        "message",
+        "Introspection failed with status 403: Resource protected by organization SSO",
+      );
+    }),
+  );
+
+  it.effect("redacts secrets from upstream JSON messages in introspection status errors", () =>
+    Effect.gen(function* () {
+      const server = yield* serveTestHttpApp(() =>
+        Effect.succeed(
+          HttpServerResponse.jsonUnsafe(
+            { message: "Authorization: Bearer github-secret-token" },
+            { status: 403 },
+          ),
+        ),
+      );
+
+      const error = yield* introspect(server.url("/graphql")).pipe(
+        Effect.provide(server.httpClientLayer),
+        Effect.flip,
+      );
+
+      expect(error).toHaveProperty(
+        "message",
+        "Introspection failed with status 403: Authorization: [redacted]",
+      );
+      expect(error).not.toHaveProperty("message", expect.stringContaining("github-secret-token"));
+    }),
+  );
+
+  it.effect("accepts standard introspection responses with omitted deepest ofType", () =>
+    Effect.gen(function* () {
+      const deepType = {
+        kind: "NON_NULL",
+        name: null,
+        ofType: {
+          kind: "LIST",
+          name: null,
+          ofType: {
+            kind: "NON_NULL",
+            name: null,
+            ofType: {
+              kind: "LIST",
+              name: null,
+              ofType: {
+                kind: "NON_NULL",
+                name: null,
+                ofType: {
+                  kind: "SCALAR",
+                  name: "String",
+                },
+              },
+            },
+          },
+        },
+      };
+      const server = yield* serveTestHttpApp(() =>
+        Effect.succeed(
+          HttpServerResponse.jsonUnsafe({
+            data: {
+              __schema: {
+                queryType: { name: "Query" },
+                mutationType: null,
+                types: [
+                  {
+                    kind: "OBJECT",
+                    name: "Query",
+                    description: null,
+                    fields: [
+                      {
+                        name: "deep",
+                        description: null,
+                        args: [],
+                        type: deepType,
+                      },
+                    ],
+                    inputFields: null,
+                    enumValues: null,
+                  },
+                  {
+                    kind: "SCALAR",
+                    name: "String",
+                    description: null,
+                    fields: null,
+                    inputFields: null,
+                    enumValues: null,
+                  },
+                ],
+              },
+            },
+          }),
+        ),
+      );
+
+      const result = yield* introspect(server.url("/graphql")).pipe(
+        Effect.provide(server.httpClientLayer),
+      );
+
+      expect(result.__schema.queryType?.name).toBe("Query");
     }),
   );
 
@@ -173,6 +307,169 @@ describe("graphqlPlugin real protocol server", () => {
 
       const requests = yield* server.requests;
       expect(requests.some((request) => request.payload.query?.includes("__schema"))).toBe(true);
+    }),
+  );
+
+  it.effect("uses initial credential bindings for add-time introspection", () =>
+    Effect.gen(function* () {
+      const server = yield* serveGraphqlTestServer({
+        schema: makeGreetingGraphqlSchema(),
+        auth: {
+          validateAuthorization: (authorization) =>
+            Effect.succeed(authorization === "Bearer secret-token"),
+        },
+      });
+      const executor = yield* createExecutor(
+        makeTestConfig({ plugins: [memorySecretsPlugin(), graphqlPlugin()] as const }),
+      );
+      yield* executor.secrets.set({
+        id: SecretId.make("github-token"),
+        scope: ScopeId.make(TEST_SCOPE),
+        name: "GitHub token",
+        value: "secret-token",
+        provider: "memory",
+      });
+
+      const result = yield* executor.graphql.addSource({
+        endpoint: server.endpoint,
+        scope: TEST_SCOPE,
+        namespace: "initial_credentials",
+        headers: {
+          Authorization: { kind: "secret", prefix: "Bearer " },
+        },
+        credentials: {
+          scope: TEST_SCOPE,
+          headers: {
+            Authorization: { kind: "secret", secretId: "github-token" },
+          },
+        },
+      });
+
+      expect(result).toEqual({ toolCount: 2, namespace: "initial_credentials" });
+      const requests = yield* server.requests;
+      expect(
+        requests.some((request) => request.headers.authorization === "Bearer secret-token"),
+      ).toBe(true);
+    }),
+  );
+
+  it.effect(
+    "uses user-scoped initial credential bindings for org-scope add-time introspection",
+    () =>
+      Effect.gen(function* () {
+        const orgScope = "org-scope";
+        const userScope = "user-scope";
+        const server = yield* serveGraphqlTestServer({
+          schema: makeGreetingGraphqlSchema(),
+          auth: {
+            validateAuthorization: (authorization) =>
+              Effect.succeed(authorization === "Bearer user-secret-token"),
+          },
+        });
+        const executor = yield* createExecutor(
+          makeTestConfig({
+            scopes: [
+              Scope.make({
+                id: ScopeId.make(userScope),
+                name: "user",
+                createdAt: new Date(),
+              }),
+              Scope.make({
+                id: ScopeId.make(orgScope),
+                name: "org",
+                createdAt: new Date(),
+              }),
+            ],
+            plugins: [memorySecretsPlugin(), graphqlPlugin()] as const,
+          }),
+        );
+        yield* executor.secrets.set({
+          id: SecretId.make("github-graphql-authorization"),
+          scope: ScopeId.make(userScope),
+          name: "GitHub GraphQL Authorization",
+          value: "user-secret-token",
+          provider: "memory",
+        });
+
+        const result = yield* executor.graphql.addSource({
+          endpoint: server.endpoint,
+          scope: orgScope,
+          name: "Github GraphQL",
+          namespace: "github_graphql",
+          headers: {
+            Authorization: { kind: "secret", prefix: "Bearer " },
+          },
+          credentials: {
+            scope: userScope,
+            headers: {
+              Authorization: {
+                kind: "secret",
+                secretId: "github-graphql-authorization",
+                secretScope: userScope,
+                prefix: "Bearer ",
+              },
+            },
+          },
+        });
+
+        expect(result).toEqual({ toolCount: 2, namespace: "github_graphql" });
+        const requests = yield* server.requests;
+        expect(
+          requests.some((request) => request.headers.authorization === "Bearer user-secret-token"),
+        ).toBe(true);
+      }),
+  );
+
+  it.effect("marks source oauth-backed when add-time credentials include oauth", () =>
+    Effect.gen(function* () {
+      const server = yield* serveGraphqlTestServer({
+        schema: makeGreetingGraphqlSchema(),
+        auth: {
+          validateAuthorization: (authorization) =>
+            Effect.succeed(authorization === "Bearer oauth-token"),
+        },
+      });
+      const executor = yield* createExecutor(
+        makeTestConfig({ plugins: [memorySecretsPlugin(), graphqlPlugin()] as const }),
+      );
+      const connectionId = ConnectionId.make("graphql-oauth2-initial");
+      yield* executor.connections.create(
+        CreateConnectionInput.make({
+          id: connectionId,
+          scope: ScopeId.make(TEST_SCOPE),
+          provider: "oauth2",
+          identityLabel: "Initial GraphQL OAuth",
+          accessToken: TokenMaterial.make({
+            secretId: SecretId.make(`${connectionId}.access_token`),
+            name: "Initial GraphQL OAuth Access Token",
+            value: "oauth-token",
+          }),
+          refreshToken: null,
+          expiresAt: null,
+          oauthScope: null,
+          providerState: null,
+        }),
+      );
+
+      const result = yield* executor.graphql.addSource({
+        endpoint: server.endpoint,
+        scope: TEST_SCOPE,
+        namespace: "initial_oauth_graphql",
+        credentials: {
+          scope: TEST_SCOPE,
+          auth: {
+            oauth2: {
+              connection: { kind: "connection", connectionId },
+            },
+          },
+        },
+      });
+
+      expect(result).toEqual({ toolCount: 2, namespace: "initial_oauth_graphql" });
+      const source = yield* executor.graphql.getSource("initial_oauth_graphql", TEST_SCOPE);
+      expect(source?.auth.kind).toBe("oauth2");
+      if (source?.auth.kind !== "oauth2") return;
+      expect(source.auth.connectionSlot).toBe(GRAPHQL_OAUTH_CONNECTION_SLOT);
     }),
   );
 
@@ -281,8 +578,19 @@ describe("graphqlPlugin real protocol server", () => {
         endpoint: server.endpoint,
         scope: TEST_SCOPE,
         namespace: "oauth_graph",
-        credentialTargetScope: TEST_SCOPE,
-        auth: { kind: "oauth2", connectionId },
+        oauth2: graphqlOAuth2Config,
+      });
+      yield* executor.sources.configure({
+        source: { id: "oauth_graph", scope: ScopeId.make(TEST_SCOPE) },
+        scope: ScopeId.make(TEST_SCOPE),
+        type: "graphql",
+        config: {
+          auth: {
+            oauth2: {
+              connection: { kind: "connection", connectionId },
+            },
+          },
+        },
       });
       yield* server.clearRequests;
 
@@ -411,7 +719,7 @@ describe("graphqlPlugin", () => {
     }),
   );
 
-  it.effect("updateSource patches endpoint/headers without re-registering", () =>
+  it.effect("sources.configure patches endpoint/headers without re-registering", () =>
     Effect.gen(function* () {
       const executor = yield* createExecutor(
         makeTestConfig({ plugins: [graphqlPlugin()] as const }),
@@ -424,9 +732,14 @@ describe("graphqlPlugin", () => {
         namespace: "patched",
       });
 
-      yield* executor.graphql.updateSource("patched", TEST_SCOPE, {
-        endpoint: "http://localhost:5000/graphql",
-        headers: { "x-custom": "abc" },
+      yield* executor.sources.configure({
+        source: { id: "patched", scope: ScopeId.make(TEST_SCOPE) },
+        scope: ScopeId.make(TEST_SCOPE),
+        type: "graphql",
+        config: {
+          endpoint: "http://localhost:5000/graphql",
+          headers: { "x-custom": "abc" },
+        },
       });
 
       const source = yield* executor.graphql.getSource("patched", TEST_SCOPE);
@@ -459,6 +772,7 @@ describe("graphqlPlugin", () => {
         {
           scope: String(orgScope),
           endpoint: "http://localhost:4000/graphql",
+          name: "Via Static",
           introspectionJson,
           namespace: "via_static",
         },
@@ -486,7 +800,7 @@ describe("graphqlPlugin", () => {
       expect(schema!.inputTypeScript).toContain("endpoint: string");
       expect(
         (schema!.inputSchema as { properties?: Record<string, unknown> }).properties,
-      ).toHaveProperty("credentialTargetScope");
+      ).not.toHaveProperty("targetScope");
       expect(schema!.inputTypeScript).not.toBe("Record<string, unknown>");
     }),
   );
@@ -537,6 +851,7 @@ describe("graphqlPlugin", () => {
         {
           endpoint: server.endpoint,
           scope: TEST_SCOPE,
+          name: "Header Materialization",
           namespace: "header_materialization",
           headers: {
             authorization: "Bearer sample-token",
@@ -651,7 +966,7 @@ describe("graphqlPlugin", () => {
     }),
   );
 
-  it.effect("updateSource on user shadow does not mutate the org row", () =>
+  it.effect("sources.configure on user shadow does not mutate the org row", () =>
     Effect.gen(function* () {
       const executor = yield* createExecutor(
         makeTestConfig({
@@ -675,9 +990,14 @@ describe("graphqlPlugin", () => {
         name: "User Source",
       });
 
-      yield* executor.graphql.updateSource("shared", USER_SCOPE, {
-        name: "User Renamed",
-        endpoint: "http://user-new.example.com/graphql",
+      yield* executor.sources.configure({
+        source: { id: "shared", scope: ScopeId.make(USER_SCOPE) },
+        scope: ScopeId.make(USER_SCOPE),
+        type: "graphql",
+        config: {
+          name: "User Renamed",
+          endpoint: "http://user-new.example.com/graphql",
+        },
       });
 
       const userView = yield* executor.graphql.getSource("shared", USER_SCOPE);
@@ -735,32 +1055,38 @@ describe("graphqlPlugin", () => {
         namespace: "shared_credentials",
         introspectionJson,
         headers: {
-          Authorization: { secretId: "org-token", prefix: "Bearer " },
+          Authorization: { kind: "secret", prefix: "Bearer " },
         },
         queryParams: {
-          token: { secretId: "org-query" },
+          token: { kind: "secret" },
         },
-        credentialTargetScope: ORG_SCOPE,
+      });
+      yield* executor.sources.configure({
+        source: { id: "shared_credentials", scope: ScopeId.make(ORG_SCOPE) },
+        scope: ScopeId.make(ORG_SCOPE),
+        type: "graphql",
+        config: {
+          headers: {
+            Authorization: { kind: "secret", secretId: "org-token", prefix: "Bearer " },
+          },
+          queryParams: {
+            token: { kind: "secret", secretId: "org-query" },
+          },
+        },
       });
 
-      yield* executor.graphql.setSourceBinding(
-        GraphqlSourceBindingInput.make({
-          sourceId: "shared_credentials",
-          sourceScope: ScopeId.make(ORG_SCOPE),
-          scope: ScopeId.make(USER_SCOPE),
-          slot: graphqlHeaderSlot("Authorization"),
-          value: { kind: "secret", secretId: SecretId.make("user-token") },
-        }),
-      );
-      yield* executor.graphql.setSourceBinding(
-        GraphqlSourceBindingInput.make({
-          sourceId: "shared_credentials",
-          sourceScope: ScopeId.make(ORG_SCOPE),
-          scope: ScopeId.make(USER_SCOPE),
-          slot: graphqlQueryParamSlot("token"),
-          value: { kind: "secret", secretId: SecretId.make("user-query") },
-        }),
-      );
+      yield* executor.sources.setBinding({
+        source: { id: "shared_credentials", scope: ScopeId.make(ORG_SCOPE) },
+        scope: ScopeId.make(USER_SCOPE),
+        slotKey: graphqlHeaderSlot("Authorization"),
+        value: { kind: "secret", secretId: SecretId.make("user-token") },
+      });
+      yield* executor.sources.setBinding({
+        source: { id: "shared_credentials", scope: ScopeId.make(ORG_SCOPE) },
+        scope: ScopeId.make(USER_SCOPE),
+        slotKey: graphqlQueryParamSlot("token"),
+        value: { kind: "secret", secretId: SecretId.make("user-query") },
+      });
 
       yield* server.clearRequests;
       const result = yield* executor.tools.invoke("shared_credentials.query.hello", {
@@ -777,7 +1103,7 @@ describe("graphqlPlugin", () => {
     }),
   );
 
-  it.effect("addSource stores direct GraphQL credential bindings at each row scope", () =>
+  it.effect("sources.configure stores GraphQL credential bindings at the target scope", () =>
     Effect.gen(function* () {
       const executor = yield* createExecutor(
         makeTestConfig({
@@ -807,34 +1133,46 @@ describe("graphqlPlugin", () => {
         namespace: "row_scoped_credentials",
         introspectionJson,
         headers: {
-          Authorization: {
-            secretId: "row-user-token",
-            prefix: "Bearer ",
-            targetScope: USER_SCOPE,
-          },
+          Authorization: { kind: "secret", prefix: "Bearer " },
         },
         queryParams: {
-          token: {
-            secretId: "row-org-query",
-            targetScope: ORG_SCOPE,
+          token: { kind: "secret" },
+        },
+      });
+      yield* executor.sources.configure({
+        source: { id: "row_scoped_credentials", scope: ScopeId.make(ORG_SCOPE) },
+        scope: ScopeId.make(ORG_SCOPE),
+        type: "graphql",
+        config: {
+          headers: {
+            Authorization: {
+              kind: "secret",
+              secretId: "row-user-token",
+              prefix: "Bearer ",
+            },
+          },
+          queryParams: {
+            token: {
+              kind: "secret",
+              secretId: "row-org-query",
+            },
           },
         },
       });
 
-      const bindings = yield* executor.graphql.listSourceBindings(
-        "row_scoped_credentials",
-        ORG_SCOPE,
-      );
+      const bindings = yield* executor.sources.listBindings({
+        source: { id: "row_scoped_credentials", scope: ScopeId.make(ORG_SCOPE) },
+      });
 
-      expect(bindings.map((binding) => binding.slot).sort()).toEqual([
+      expect(bindings.map((binding) => binding.slotKey).sort()).toEqual([
         graphqlHeaderSlot("Authorization"),
         graphqlQueryParamSlot("token"),
       ]);
       expect(
-        bindings.find((binding) => binding.slot === graphqlHeaderSlot("Authorization"))?.scopeId,
-      ).toBe(ScopeId.make(USER_SCOPE));
+        bindings.find((binding) => binding.slotKey === graphqlHeaderSlot("Authorization"))?.scopeId,
+      ).toBe(ScopeId.make(ORG_SCOPE));
       expect(
-        bindings.find((binding) => binding.slot === graphqlQueryParamSlot("token"))?.scopeId,
+        bindings.find((binding) => binding.slotKey === graphqlQueryParamSlot("token"))?.scopeId,
       ).toBe(ScopeId.make(ORG_SCOPE));
     }),
   );
@@ -863,9 +1201,18 @@ describe("graphqlPlugin", () => {
         namespace: "org_bound_secret",
         introspectionJson,
         headers: {
-          Authorization: { secretId: "shared-token", prefix: "Bearer " },
+          Authorization: { kind: "secret", prefix: "Bearer " },
         },
-        credentialTargetScope: ORG_SCOPE,
+      });
+      yield* executor.sources.configure({
+        source: { id: "org_bound_secret", scope: ScopeId.make(ORG_SCOPE) },
+        scope: ScopeId.make(ORG_SCOPE),
+        type: "graphql",
+        config: {
+          headers: {
+            Authorization: { kind: "secret", secretId: "shared-token", prefix: "Bearer " },
+          },
+        },
       });
 
       yield* executor.secrets.set({
@@ -926,8 +1273,19 @@ describe("graphqlPlugin", () => {
           scope: ORG_SCOPE,
           namespace: "org_bound_connection",
           introspectionJson,
-          auth: { kind: "oauth2", connectionId },
-          credentialTargetScope: ORG_SCOPE,
+          oauth2: graphqlOAuth2Config,
+        });
+        yield* executor.sources.configure({
+          source: { id: "org_bound_connection", scope: ScopeId.make(ORG_SCOPE) },
+          scope: ScopeId.make(ORG_SCOPE),
+          type: "graphql",
+          config: {
+            auth: {
+              oauth2: {
+                connection: { kind: "connection", connectionId },
+              },
+            },
+          },
         });
 
         yield* executor.connections.create(
@@ -962,7 +1320,7 @@ describe("graphqlPlugin", () => {
       }),
   );
 
-  it.effect("updateSource removes bindings for credential slots no longer present", () =>
+  it.effect("sources.configure removes bindings for credential slots no longer present", () =>
     Effect.gen(function* () {
       const executor = yield* createExecutor(
         makeTestConfig({
@@ -984,15 +1342,25 @@ describe("graphqlPlugin", () => {
         scope: ORG_SCOPE,
         namespace: "stale_binding",
         introspectionJson,
-        headers: { "X-Old": { secretId: "old-token" } },
-        credentialTargetScope: ORG_SCOPE,
+        headers: { "X-Old": { kind: "secret" } },
+      });
+      yield* executor.sources.configure({
+        source: { id: "stale_binding", scope: ScopeId.make(ORG_SCOPE) },
+        scope: ScopeId.make(ORG_SCOPE),
+        type: "graphql",
+        config: { headers: { "X-Old": { kind: "secret", secretId: "old-token" } } },
       });
 
-      yield* executor.graphql.updateSource("stale_binding", ORG_SCOPE, {
-        headers: {},
+      yield* executor.sources.configure({
+        source: { id: "stale_binding", scope: ScopeId.make(ORG_SCOPE) },
+        scope: ScopeId.make(ORG_SCOPE),
+        type: "graphql",
+        config: { headers: {} },
       });
 
-      const bindings = yield* executor.graphql.listSourceBindings("stale_binding", ORG_SCOPE);
+      const bindings = yield* executor.sources.listBindings({
+        source: { id: "stale_binding", scope: ScopeId.make(ORG_SCOPE) },
+      });
       expect(bindings).toEqual([]);
     }),
   );
@@ -1025,11 +1393,21 @@ describe("graphqlPlugin", () => {
         scope: TEST_SCOPE,
         introspectionJson,
         namespace: "with_secret",
-        credentialTargetScope: TEST_SCOPE,
         headers: {
-          Authorization: { secretId: "api-key", prefix: "Bearer " },
+          Authorization: { kind: "secret", prefix: "Bearer " },
         },
-        queryParams: { token: { secretId: "api-key" } },
+        queryParams: { token: { kind: "secret" } },
+      });
+      yield* executor.sources.configure({
+        source: { id: "with_secret", scope: ScopeId.make(TEST_SCOPE) },
+        scope: ScopeId.make(TEST_SCOPE),
+        type: "graphql",
+        config: {
+          headers: {
+            Authorization: { kind: "secret", secretId: "api-key", prefix: "Bearer " },
+          },
+          queryParams: { token: { kind: "secret", secretId: "api-key" } },
+        },
       });
 
       const usages = yield* executor.secrets.usages(SecretId.make("api-key"));
@@ -1064,8 +1442,13 @@ describe("graphqlPlugin", () => {
         scope: TEST_SCOPE,
         introspectionJson,
         namespace: "ref",
-        credentialTargetScope: TEST_SCOPE,
-        headers: { "X-Token": { secretId: "locked" } },
+        headers: { "X-Token": { kind: "secret" } },
+      });
+      yield* executor.sources.configure({
+        source: { id: "ref", scope: ScopeId.make(TEST_SCOPE) },
+        scope: ScopeId.make(TEST_SCOPE),
+        type: "graphql",
+        config: { headers: { "X-Token": { kind: "secret", secretId: "locked" } } },
       });
 
       const result = yield* executor.secrets
@@ -1124,8 +1507,19 @@ describe("graphqlPlugin", () => {
         scope: TEST_SCOPE,
         introspectionJson,
         namespace: "oauth_ref",
-        credentialTargetScope: TEST_SCOPE,
-        auth: { kind: "oauth2", connectionId },
+        oauth2: graphqlOAuth2Config,
+      });
+      yield* executor.sources.configure({
+        source: { id: "oauth_ref", scope: ScopeId.make(TEST_SCOPE) },
+        scope: ScopeId.make(TEST_SCOPE),
+        type: "graphql",
+        config: {
+          auth: {
+            oauth2: {
+              connection: { kind: "connection", connectionId },
+            },
+          },
+        },
       });
 
       const usages = yield* executor.connections.usages(connectionId);
